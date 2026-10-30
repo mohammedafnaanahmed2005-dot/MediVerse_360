@@ -1,0 +1,13 @@
+[project]
+name = "mediverse360"
+version = "0.1.0"
+requires-python = ">=3.11"
+# Resolved from Snowflake's built-in PyPI mirror (ARTIFACT_REPOSITORIES). Streamlit is pinned to a
+# version Snowflake lists as supported. OpenCV (contrib, headless) provides the Haar face detector
+# used by the LBP face verifier; without it the app falls back to the labelled mock.
+dependencies = [
+    "streamlit[snowflake]==1.52.2",
+    "snowflake-connector-python>=3.3.0",
+    "opencv-contrib-python-headless>=4.9",
+    "python-docx>=1.1",
+]

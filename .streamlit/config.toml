@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#0F7C8C"
+baseRadius = "0.5rem"
+
+[client]
+showErrorDetails = false

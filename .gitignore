@@ -1,0 +1,8 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+data/synthetic/
+.snowflake/

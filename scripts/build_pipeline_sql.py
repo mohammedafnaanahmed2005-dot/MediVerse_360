@@ -1,0 +1,168 @@
+"""Generate sql/02_pipeline.sql from mediverse/schema_spec.py.
+
+The generated script defines:
+  * CURATED tables with declared PK/FK constraints (Snowflake does not enforce
+    them, so the pipeline validates them explicitly),
+  * STAGING.DQ_ISSUES,
+  * STAGING.RUN_PIPELINE(P_REPLACE BOOLEAN): RAW -> STAGING (typed) -> DQ rules
+    -> CURATED (only rows with no ERROR-severity issue are promoted).
+
+Run:  python scripts/build_pipeline_sql.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from mediverse.schema_spec import SNOWFLAKE_TYPES, TABLES  # noqa: E402
+
+
+def q(c: str) -> str:
+    return f'"{c.upper()}"'
+
+
+def cast(col: str, typ: str) -> str:
+    c = f"NULLIF(TRIM({q(col)}), '')"
+    return {
+        "S": c,
+        "I": f"TRY_TO_NUMBER({c})",
+        "F": f"TRY_TO_DECIMAL({c}, 14, 2)",
+        "D": f"TRY_TO_DATE({c}, 'YYYY-MM-DD')",
+        "T": f"TRY_TO_TIMESTAMP_NTZ({c})",
+        "B": f"IFF({c} IN ('1','true','TRUE'), TRUE, IFF({c} IN ('0','false','FALSE'), FALSE, NULL))",
+    }[typ]
+
+
+def curated_ddl(name: str, spec: dict) -> str:
+    cols = [f"  {q(c)} {SNOWFLAKE_TYPES[t]}{' NOT NULL' if req else ''}" for c, t, req in spec["cols"]]
+    cols.append(f"  CONSTRAINT PK_{name.upper()} PRIMARY KEY ({q(spec['pk'])})")
+    for i, (c, parent, pc) in enumerate(spec.get("fks", []), 1):
+        cols.append(f"  CONSTRAINT FK_{name.upper()}_{i} FOREIGN KEY ({q(c)}) REFERENCES CURATED.{parent.upper()} ({q(pc)})")
+    cols.append("  _LOADED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()")
+    # constraint lines must precede the extra column; reorder
+    body = [x for x in cols if "CONSTRAINT" not in x] + [x for x in cols if "CONSTRAINT" in x]
+    return f"CREATE TABLE IF NOT EXISTS CURATED.{name.upper()} (\n" + ",\n".join(body) + "\n);"
+
+
+def table_steps(name: str, spec: dict) -> list[str]:
+    T = name.upper()
+    pk = q(spec["pk"])
+    typed = [c for c, t, _ in spec["cols"] if t != "S"]
+    sel = ",\n      ".join(f"{cast(c, t)} AS {q(c)}" for c, t, _ in spec["cols"])
+    fail = ", ".join(
+        f"IFF(NULLIF(TRIM({q(c)}), '') IS NOT NULL AND {cast(c, t)} IS NULL, '{c}', NULL)"
+        for c, t, _ in spec["cols"] if t != "S") or "NULL"
+    steps = [f"""CREATE OR REPLACE TABLE STAGING.{T} AS
+    SELECT
+      {sel},
+      ARRAY_CONSTRUCT_COMPACT({fail}) AS _CAST_FAIL,
+      ROW_NUMBER() OVER (ORDER BY _FILE, {pk}) AS _ROW_NUM,
+      _FILE
+    FROM RAW.{T}"""]
+
+    ins = ("INSERT INTO STAGING.DQ_ISSUES (RUN_ID, TABLE_NAME, RECORD_ID, ROW_NUM, RULE_CODE, COLUMN_NAME, SEVERITY, DETAILS)\n    ")
+    if typed:
+        steps.append(ins + f"""SELECT :run_id, '{T}', {pk}, _ROW_NUM, 'INVALID_FORMAT', f.value::STRING, 'ERROR',
+           'Value could not be converted to the expected type'
+    FROM STAGING.{T}, LATERAL FLATTEN(_CAST_FAIL) f""")
+    for c, _t, req in spec["cols"]:
+        if req:
+            steps.append(ins + f"""SELECT :run_id, '{T}', {pk}, _ROW_NUM, 'REQUIRED_MISSING', '{c}', 'ERROR', 'Required field is empty'
+    FROM STAGING.{T} WHERE {q(c)} IS NULL AND NOT ARRAY_CONTAINS('{c}'::VARIANT, _CAST_FAIL)""")
+    steps.append(ins + f"""SELECT :run_id, '{T}', {pk}, _ROW_NUM, 'DUPLICATE_ID', '{spec['pk']}', 'ERROR', 'Primary key appears more than once'
+    FROM STAGING.{T} WHERE {pk} IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY {pk} ORDER BY _ROW_NUM) > 1""")
+    for c, parent, pc in spec.get("fks", []):
+        steps.append(ins + f"""SELECT :run_id, '{T}', s.{pk}, s._ROW_NUM, 'FK_ORPHAN', '{c}', 'ERROR',
+           'No matching {parent}.{pc} in CURATED: ' || s.{q(c)}
+    FROM STAGING.{T} s
+    WHERE s.{q(c)} IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM CURATED.{parent.upper()} p WHERE p.{q(pc)} = s.{q(c)})""")
+    for rule, pred, sev in spec.get("checks", []):
+        safe = pred.replace("'", "''")
+        steps.append(ins + f"""SELECT :run_id, '{T}', {pk}, _ROW_NUM, '{rule}', NULL, '{sev}', 'Failed check: {safe}'
+    FROM STAGING.{T} WHERE {pred}""")
+
+    cols = ", ".join(q(c) for c, _, _ in spec["cols"])
+    steps.append(f"""INSERT INTO CURATED.{T} ({cols})
+    SELECT {cols} FROM STAGING.{T} s
+    WHERE NOT EXISTS (SELECT 1 FROM STAGING.DQ_ISSUES i
+                      WHERE i.RUN_ID = :run_id AND i.TABLE_NAME = '{T}' AND i.SEVERITY = 'ERROR'
+                        AND i.ROW_NUM = s._ROW_NUM)
+      AND NOT EXISTS (SELECT 1 FROM CURATED.{T} c WHERE c.{pk} = s.{pk})""")
+    steps.append(f"""INSERT INTO STAGING.PIPELINE_RUNS (RUN_ID, TABLE_NAME, RAW_ROWS, CURATED_ROWS, ERROR_ROWS)
+    SELECT :run_id, '{T}',
+      (SELECT COUNT(*) FROM STAGING.{T}),
+      (SELECT COUNT(*) FROM CURATED.{T}),
+      (SELECT COUNT(DISTINCT ROW_NUM) FROM STAGING.DQ_ISSUES WHERE RUN_ID = :run_id AND TABLE_NAME = '{T}' AND SEVERITY = 'ERROR')""")
+    return steps
+
+
+def build() -> str:
+    out = ["-- GENERATED by scripts/build_pipeline_sql.py from mediverse/schema_spec.py. Do not edit by hand.",
+           "USE ROLE MV_APP_OWNER;", "USE WAREHOUSE MEDIVERSE_WH;", "USE DATABASE MEDIVERSE360;", ""]
+    for name, spec in TABLES.items():
+        out.append(curated_ddl(name, spec))
+    out.append("""
+CREATE TABLE IF NOT EXISTS STAGING.DQ_ISSUES (
+  ISSUE_ID     STRING DEFAULT UUID_STRING(),
+  RUN_ID       STRING,
+  TABLE_NAME   STRING,
+  RECORD_ID    STRING,
+  ROW_NUM      NUMBER,
+  RULE_CODE    STRING,
+  COLUMN_NAME  STRING,
+  SEVERITY     STRING,
+  DETAILS      STRING,
+  DETECTED_AT  TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+  STATUS       STRING DEFAULT 'OPEN',
+  AI_CATEGORY  STRING,
+  REVIEWED_BY  STRING,
+  REVIEWED_AT  TIMESTAMP_LTZ,
+  RESOLUTION   STRING
+);
+CREATE TABLE IF NOT EXISTS STAGING.PIPELINE_RUNS (
+  RUN_ID STRING, TABLE_NAME STRING, RAW_ROWS NUMBER, CURATED_ROWS NUMBER, ERROR_ROWS NUMBER,
+  RUN_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(), RUN_BY STRING DEFAULT CURRENT_USER()
+);
+""")
+    body = []
+    body.append("""  run_id := UUID_STRING();
+  IF (P_REPLACE) THEN""")
+    for name in reversed(list(TABLES)):
+        body.append(f"    DELETE FROM CURATED.{name.upper()};")
+    body.append("  END IF;")
+    for name, spec in TABLES.items():
+        for s in table_steps(name, spec):
+            body.append("  " + s + ";")
+    body.append("  RETURN run_id;")
+    out.append("CREATE OR REPLACE PROCEDURE STAGING.RUN_PIPELINE(P_REPLACE BOOLEAN)\nRETURNS STRING\nLANGUAGE SQL\nEXECUTE AS OWNER\nAS\n$$\nDECLARE\n  run_id STRING;\nBEGIN\n"
+               + "\n".join(body) + "\nEND;\n$$;")
+    return "\n".join(out) + "\n"
+
+
+def build_validation() -> str:
+    """Independent CURATED integrity check: returns zero rows when PKs are unique and no FK is orphaned."""
+    parts = []
+    for name, spec in TABLES.items():
+        T = name.upper()
+        parts.append(f"SELECT '{T}' AS tbl, 'PK_DUPLICATE' AS chk, COUNT(*) - COUNT(DISTINCT {q(spec['pk'])}) AS bad FROM CURATED.{T}")
+        for c, parent, pc in spec.get("fks", []):
+            parts.append(f"SELECT '{T}', 'FK_ORPHAN_{c.upper()}', COUNT(*) FROM CURATED.{T} x "
+                         f"WHERE x.{q(c)} IS NOT NULL AND NOT EXISTS "
+                         f"(SELECT 1 FROM CURATED.{parent.upper()} y WHERE y.{q(pc)} = x.{q(c)})")
+    return ("-- GENERATED. Independent integrity check of CURATED; expect zero rows.\n"
+            "USE DATABASE MEDIVERSE360;\nSELECT * FROM (\n  " + "\n  UNION ALL ".join(parts) + "\n) WHERE bad > 0;\n")
+
+
+if __name__ == "__main__":
+    path = ROOT / "sql" / "02_pipeline.sql"
+    path.write_text(build(), encoding="utf-8")
+    print(f"wrote {path}")
+    vpath = ROOT / "sql" / "03_validate_curated.sql"
+    vpath.write_text(build_validation(), encoding="utf-8")
+    print(f"wrote {vpath}")

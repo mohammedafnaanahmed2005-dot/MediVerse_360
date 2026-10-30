@@ -1,0 +1,10 @@
+# Local development and tests (Python 3.11-3.13). The deployed app uses pyproject.toml.
+streamlit[snowflake]>=1.52,<2
+snowflake-snowpark-python>=1.20
+snowflake-connector-python>=3.3.0
+altair>=5
+pandas>=2
+pillow>=10
+pytest>=8
+python-docx>=1.1
+opencv-contrib-python-headless>=4.9

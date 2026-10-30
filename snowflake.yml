@@ -1,0 +1,21 @@
+definition_version: 2
+entities:
+  mediverse360_app:
+    type: streamlit
+    identifier:
+      name: MEDIVERSE360_APP
+      database: MEDIVERSE360
+      schema: APP
+    title: MediVerse 360
+    query_warehouse: MEDIVERSE_WH
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    compute_pool: SYSTEM_COMPUTE_POOL_CPU
+    artifact_repositories:
+      - snowflake.snowpark.pypi_shared_repository
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - pyproject.toml
+      - .streamlit/config.toml
+      - app_pages/
+      - mediverse/
